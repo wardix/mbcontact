@@ -238,7 +238,6 @@ def update_messagebird_contact(config, data):
         '%s%s' % (config['updateUrl'], response_data['contact']['id']),
         headers=headers,
         data=json.dumps({'lastName': ''}))
-    response_data = response.json()
 
 
 def main():
