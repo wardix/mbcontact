@@ -1,0 +1,14 @@
+---
+database:
+  user: root
+  password: secret
+  host: localhost
+  db: messagebird
+
+period: 305
+
+messagebird:
+  accessKey: xxxxxxxxxxxxxxxxxxxxxxxxx
+  upsertUrl: https://contacts.messagebird.com/v2/ops/contacts/upsert
+  updateUrl: https://contacts.messagebird.com/v2/contacts/
+...

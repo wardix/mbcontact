@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+
+import pymysql
+import json
+import requests
+import time
+import argparse
+import yaml
+
+def remove_non_numeric(str):
+    return ''.join([char for char in str if char.isnumeric()])
+
+
+def remove_extra_spaces(str):
+    return ' '.join(str.split())
+
+
+def extract_full_name(name):
+    full_name = remove_extra_spaces(name)
+    chunks = full_name.split(maxsplit=1) if full_name else []
+    first_name = (chunks.pop(0) if chunks else '')
+    last_name = (chunks.pop(0) if chunks else '')
+    return (first_name, last_name)
+
+
+def get_period(delta_seconds):
+    now = time.mktime(time.localtime())
+    prev_period = now - delta_seconds
+    time_now = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))
+    time_prev = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(prev_period))
+    return (time_prev, time_now)
+
+
+def get_new_phones(cursor, period_start, period_end):
+    query = (
+        'SELECT phone FROM sms_phonebook'
+        ' WHERE insertTime >= %s'
+        ' AND insertTime < %s AND custId IS NOT NULL')
+    cursor.execute(query, [period_start, period_end])
+    return {row[0] for row in cursor}
+
+
+def get_edited_phones(cursor, period_start, period_end):
+    query = (
+        'SELECT DISTINCT IFNULL(ld2.value, p.phone) phone'
+        ' FROM table_log_detail ld'
+        ' LEFT JOIN table_log l ON l.id = ld.log_id'
+        ' LEFT JOIN sms_phonebook p ON p.id = ld.value'
+        " LEFT JOIN table_log_detail ld2 ON ld2.log_id = ld.log_id and ld2.field = 'phone'"
+        " WHERE l.table_name = 'sms_phonebook'"
+        " AND ld.field = 'id'"
+        " AND l.insert_time >= %s AND l.insert_time < %s"
+        ' HAVING phone IS NOT NULL')
+    cursor.execute(query, [period_start, period_end])
+    return {row[0] for row in cursor}
+
+
+def get_updated_services_phones(cursor, period_start, period_end):
+    query = (
+        'SELECT DISTINCT p.phone'
+        ' FROM CustomerServicesHistoryNew h'
+        ' LEFT JOIN CustomerServices cs ON cs.CustServId = h.cust_serv_id'
+        ' LEFT JOIN sms_phonebook p ON p.custId = cs.CustId'
+        ' WHERE p.phone IS NOT NULL'
+        ' AND h.insert_time >= %s AND h.insert_time < %s'
+        " AND ("
+        " h.description LIKE 'Change Package :%%' OR"
+        " h.description LIKE 'Activation%%' OR"
+        " h.description LIKE 'Edit Service :%%Alamat Pemasangan :%%' OR"
+        " h.description LIKE 'Edit Service :%%Service :%%' OR"
+        " h.description LIKE 'Edit Service :%%Account Name :%%' OR"
+        " h.description LIKE 'Close :%%')")
+    cursor.execute(query, [period_start, period_end])
+    return {row[0] for row in cursor}
+
+
+def get_updated_phones(cursor, period_start, period_end):
+    phones = get_new_phones(cursor, period_start, period_end)
+    phones |= get_edited_phones(cursor, period_start, period_end)
+    phones |= get_updated_services_phones(cursor, period_start, period_end)
+    return sorted(
+        list(filter(lambda x: 8 <= len(remove_non_numeric(x)) <= 15, phones)))
+
+
+def get_name_customer_id(cursor, phone):
+    """get name and list customer id from sms_phonebook table"""
+    query = (
+        'SELECT name, custId FROM sms_phonebook'
+        ' WHERE phone = %s AND custId IS NOT NULL'
+        ' ORDER BY insertTime DESC')
+    cursor.execute(query, [phone])
+
+    full_name, customer_id = (cursor.fetchone() or ['', ''])
+    if not customer_id:
+        return []
+
+    list_customer_id = list(
+        set([customer_id] + [row[1] for row in cursor.fetchall()]))
+
+    return (full_name, list_customer_id)
+
+
+
+def get_customer_name(cursor, list_customer_id):
+    """get customer name from customer table"""
+    query = (
+        'SELECT CustName FROM Customer'
+        ' WHERE CustId IN %s'
+        ' AND LENGTH(TRIM(CustName)) > 0'
+        ' ORDER BY CustId DESC')
+    cursor.execute(query, [list_customer_id])
+    return (cursor.fetchone() or [''])[0]
+
+
+def get_customer_company_branch(cursor, list_customer_id):
+    query = (
+        'SELECT CustCompany, IFNULL(DisplayBranchId, BranchId)'
+        ' FROM Customer WHERE CustId IN %s')
+    cursor.execute(query, [list_customer_id])
+    return (
+        list({row[0] for row in cursor}),
+        list({row[1] for row in cursor}))
+
+
+def get_customer_extra_attribute(cursor, list_customer_id):
+    query = (
+        'SELECT cs.CustId, s.ServiceType, cs.CustAccName,'
+        ' cs.installation_address, c.CustCompany,'
+        ' IFNULL(c.DisplayBranchId, c.BranchId)'
+        ' FROM CustomerServices cs'
+        ' LEFT JOIN Services s ON cs.ServiceId = s.ServiceId'
+        ' LEFT JOIN Customer c ON cs.CustId = c.CustId'
+        ' WHERE cs.CustId IN %s AND cs.CustStatus != %s')
+    cursor.execute(query, [list_customer_id, 'NA'])
+    list_subscription = cursor.fetchall()
+
+    services = filter(
+        lambda x: not('domain' in x.lower()),
+        (remove_extra_spaces(row[1]) for row in list_subscription))
+    accounts = (
+        remove_extra_spaces(row[2]) for row in list_subscription if row[2])
+    addresses = (
+        remove_extra_spaces(row[3]) for row in list_subscription if row[3])
+    companies = list({
+        remove_extra_spaces(row[4]) for row in list_subscription if row[4]})
+    branches = list({
+        remove_extra_spaces(row[5]) for row in list_subscription if row[4]})
+
+    return {
+        'services': services,
+        'accounts': accounts,
+        'addresses': addresses,
+        'companies': companies,
+        'branches': branches}
+
+
+def get_contact_detail(cursor, phone):
+    name_customer_id = get_name_customer_id(cursor, phone)
+    if not name_customer_id:
+        return {}
+
+    full_name, list_customer_id = name_customer_id
+
+    if not full_name:
+        full_name = get_customer_name(cursor, list_customer_id)
+
+    first_name, last_name = extract_full_name(full_name)
+
+    list_company, list_branch = get_customer_company_branch(
+        cursor, list_customer_id)
+
+    extra_attribute = get_customer_extra_attribute(cursor, list_customer_id)
+
+    return {
+        'full_name': full_name,
+        'first_name': first_name,
+        'last_name': last_name,
+        'ids': ', '.join(sorted(list_customer_id)),
+        'companies':
+            # companies from active subscription over
+            ', '.join(sorted(extra_attribute['companies']))
+                if (extra_attribute['companies'])
+                # all companies including not active subscription
+                else ', '.join(sorted(list_company)),
+        'branches':
+            extra_attribute['branches']
+                if (extra_attribute['branches'])
+                else list_branch,
+        'services': ', '.join(sorted(extra_attribute['services'])),
+        'accounts': ', '.join(sorted(extra_attribute['accounts'])),
+        'addresses': '; '.join(sorted(extra_attribute['addresses']))}
+
+
+def construct_updated_data(phone, data):
+    return {
+        'updateContact': True,
+        'contact': {
+            'displayName': data['full_name'],
+            'firstName': data['first_name'],
+            'lastName': data['last_name'],
+            'timezone':
+                'Asia/Makassar' if ('062' in data['branches'])
+                    else 'Asia/Jakarta',
+            'identifiers': [{
+                'type': 'phonenumber',
+                'value': phone}],
+            'attributes': {
+                'ids': data['ids'],
+                'companies': data['companies'],
+                'services': data['services'],
+                'accounts': data['accounts'],
+                'addresses': data['addresses'],
+                # remove old attributes
+                'cust_ids': None,
+                'company_names': None,
+                'account_names': None,
+                'installation_addresses': None,
+                'priority': None}}}
+
+
+def update_messagebird_contact(config, data):
+    headers = {
+        'Authorization': 'AccessKey %s' % (config['accessKey'],), 
+        'Content-Type': 'application/json'}
+
+    response = requests.post(
+        config['upsertUrl'],
+        headers=headers,
+        data=json.dumps(data))
+
+    response_data = response.json()
+    # messagebird upsert bug, can not reset lastName to empty string
+    if (data['contact']['lastName'] or
+        (not response_data['contact']['lastName'])):
+        print('upsert:')
+        print(data)
+        print(json.dumps(response_data))
+        return
+
+    response = requests.patch(
+        '%s%s' % (config['updateUrl'], response_data['contact']['id']),
+        headers=headers,
+        data=json.dumps({'lastName': ''}))
+    response_data = response.json()
+    print('update:')
+    print(data)
+    print(json.dumps(response_data))
+
+
+def main():
+    default_period = 3600
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config', help='Path to config file')
+    parser.add_argument('--period', type=int, help='Period in seconds')
+    args = parser.parse_args()
+    if not args.config:
+        print('The --config argument is not provided')
+        quit()
+
+    with open(args.config, 'r') as f:
+        config = yaml.safe_load(f)
+
+    if not 'database' in config:
+        print('No database configuration in %s file' % (args.config,))
+        quit()
+
+    if not 'messagebird' in config:
+        print('No messagebird configuration in %s file' % (args.config,))
+        quit()
+
+    period = (
+        args.period if args.period
+        else (config['period'] if ('period' in config) else default_period))
+
+    cnx = pymysql.connect(**config['database'])
+    cursor = cnx.cursor()
+
+    start_period, end_period = get_period(period)
+    phones = get_updated_phones(cursor, start_period, end_period)
+
+    contact = {}
+    for phone in phones:
+        contact_detail = get_contact_detail(cursor, phone)
+        if not contact_detail:
+            continue
+        phone = remove_non_numeric(phone)
+        contact[phone] = contact_detail
+    cursor.close()
+    cnx.close()
+
+    for phone, data in contact.items():
+        updated_data = construct_updated_data(phone, data)
+        update_messagebird_contact(config['messagebird'], updated_data)
+
+
+if __name__ == '__main__':
+    main()
