@@ -232,9 +232,6 @@ def update_messagebird_contact(config, data):
     # messagebird upsert bug, can not reset lastName to empty string
     if (data['contact']['lastName'] or
         (not response_data['contact']['lastName'])):
-        print('upsert:')
-        print(data)
-        print(json.dumps(response_data))
         return
 
     response = requests.patch(
@@ -242,9 +239,6 @@ def update_messagebird_contact(config, data):
         headers=headers,
         data=json.dumps({'lastName': ''}))
     response_data = response.json()
-    print('update:')
-    print(data)
-    print(json.dumps(response_data))
 
 
 def main():
