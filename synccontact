@@ -210,6 +210,7 @@ def construct_updated_data(phone, data):
                 'services': data['services'],
                 'accounts': data['accounts'],
                 'addresses': data['addresses'],
+                'branches': data['branches'],
                 # remove old attributes
                 'cust_ids': None,
                 'company_names': None,
